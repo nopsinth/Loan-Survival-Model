@@ -271,17 +271,9 @@ cov.train <- as.matrix(cov.train)
 surv.response <- Surv(sample$Stop, sample$LoanStatus)
 cv.cox.fit <- cv.glmnet(cov.train, surv.response, family = "cox", nfolds = 10)
 cox.fit.elastic <- glmnet(cov.train, surv.response, family = "cox", alpha = 0.5)
-all.covariates <- coef(cox.fit, s = cv.cox.fit$lambda.min)
+all.covariates <- coef(cox.fit.elastic, s = cv.cox.fit$lambda.min)
 selected.indices <- which(all.covariates != 0)
 selected.covariates <- (all.covariates[selected.indices])
-```
-
-```{r}
-all.covariates
-```
-
-```{r}
-plot()
 ```
 
 ```{r}
