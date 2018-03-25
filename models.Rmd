@@ -1,0 +1,755 @@
+---
+title: "MS&E246 SBA Loan Survival Analysis"
+output:
+pdf_document: default
+html_notebook: default
+html_document: default
+---
+
+#R packages
+We first install all packages related to survival analysis.
+The more information about packages are attached below:
+
+```{r}
+install.packages("survival")
+install.packages("ROCR")
+install.packages("muhaz")
+install.packages("cvTools")
+install.packages("dynamichazard")
+install.packages("pec")
+```
+
+Upload the original data
+```{r}
+loan_data <- read.csv("loan_data_modified3.csv", na.strings = "NA")
+loan_data <- loan_data[!is.na(loan_data$LoanStatus), ]
+```
+
+Ignore all loans that have "CANCLD" and "EXEMPT" status
+```{r}
+loan_data <- loan_data[(loan_data$LoanStatus == "PIF") | (loan_data$LoanStatus == "CHGOFF"),]
+```
+
+Delete all the covariates that don't contribute to our analysis
+```{r}
+loan_data$X...Program <- NULL
+loan_data$NaicsDescription <- NULL
+loan_data$ThirdPartyLender_Name <- NULL
+loan_data$BorrName <- NULL
+loan_data$BorrStreet <- NULL
+loan_data$CDC_Name <- NULL
+loan_data$CDC_Street <- NULL
+loan_data$ThirdPartyLender_Name <- NULL
+loan_data$NaicsDescription <- NULL
+loan_data$subpgmdesc <- NULL
+```
+
+#Data preprocessing
+We deal with a particular covariate and decide if it should be a category or numerical based on the insights we expect to gain.
+
+Categorize all states into their corresponding regions
+```{r}
+NE.ref <- c("CT","ME","MA","NH","RI","VT","NJ","NY","PA")
+MW.ref <- c("IN","IL","MI","OH","WI","IA","KS","MN","MO","NE","ND","SD")
+S.ref <- c("DE","DC","FL","GA","MD","NC","SC","VA","WV","AL","KY","MS","TN","AR","LA","OK","TX")
+W.ref <- c("AZ","CO","ID","NM","MT","UT","NV","WY","AK","CA","HI","OR","WA")
+
+loan_data$BorrRegion <- NA
+for(i in 1:nrow(loan_data)){
+  ifelse(loan_data$BorrState[i] %in% NE.ref, loan_data$BorrRegion[i] <- "Northeast",
+         ifelse(loan_data$BorrState[i] %in% MW.ref, loan_data$BorrRegion[i] <- "Midwest",
+                ifelse(loan_data$BorrState[i] %in% S.ref, loan_data$BorrRegion[i] <- "South",
+                       ifelse(loan_data$BorrState[i] %in% W.ref, loan_data$BorrRegion[i] <- "West", loan_data$BorrRegion[i] <- "International"))))
+}
+```
+
+Truncate NaicsCode into only first 2 letters
+```{r}
+loan_data = mutate(loan_data, NaicsTrimmed = strtrim(loan_data$NaicsCode, 2))
+#colnames(loan_data)[colnames(loan_data)=="strtrim(loan_data$NaicsCode, 2)"] <- "NaicsTrimmed"
+loan_data$NaicsTrimmed = as.factor(loan_data$NaicsTrimmed)
+```
+
+Factorize categorial variables
+```{r}
+loan_data$DeliveryMethod <- as.factor(loan_data$DeliveryMethod)
+```
+
+Treat the approval date as a continuous variable
+```{r}
+loan_data$Cont_ApprovalDate <- as.integer(as.Date(loan_data$ApprovalDate, "%m/%d/%Y") - as.Date("1990-01-01"))
+```
+
+Assign 0-1 values to each loan. If the loan is default, the assigned value is 1 and 0 otherwise.
+```{r}
+loan_data$LoanStatus <- as.character(loan_data$LoanStatus)
+loan_data$LoanStatus[loan_data$LoanStatus == "PIF"] = 0
+loan_data$LoanStatus[loan_data$LoanStatus == "CHGOFF"] = 1
+loan_data$LoanStatus <- as.numeric(loan_data$LoanStatus)
+```
+
+Create "TotalLoanAmount" column that refers to the sum of Gross Approval amount and Third Party Lending amount.
+```{r}
+loan_data$TotalLoanAmount <- NA
+for (i in 1:nrow(loan_data)) {
+  if (is.na(loan_data$ThirdPartyDollars[i])) {
+    loan_data$TotalLoanAmount[i] <- loan_data$GrossApproval[i]
+  } else {
+    loan_data$TotalLoanAmount[i] <- (loan_data$ThirdPartyDollars[i] + loan_data$GrossApproval[i])
+  }
+}
+```
+
+Create "LossRatio" column that refers to the ratio of Gross Charge Off amount to Total Loan amount
+```{r}
+loan_data$LossRatio <- NA
+for (i in 1:nrow(loan_data)) {
+  if (!is.na(loan_data$ChargeOffDate[i])) {
+    loan_data$LossRatio[i] <- (loan_data$GrossChargeOffAmount[i])/(loan_data$TotalLoanAmount[i])
+  }
+}
+```
+
+Create "LoanAge" (in months) column that refers to how long each loan survives
+```{r}
+loan_data$LoanAge <- NA
+for (i in 1:nrow(loan_data)) {
+  if (!is.na(loan_data$ChargeOffDate[i])) {
+    loan_data$LoanAge[i] <- as.integer((as.Date(loan_data$ChargeOffDate[i], "%m/%d/%Y") - as.Date(loan_data$ApprovalDate[i], "%m/%d/%Y"))/30)
+  } else {
+    loan_data$LoanAge[i] <- loan_data$TermInMonths[i]
+  }
+}
+```
+
+Create the indicator of whether CDC_state is the same as BorrState
+```{r}
+loan_data$BorrSameCDC <- NA
+loan_data$BorrState <- as.character(loan_data$BorrState)
+loan_data$CDC_State <- as.character(loan_data$CDC_State)
+loan_data$ProjectState <- as.character(loan_data$ProjectState)
+for (i in 1:nrow(loan_data)) {
+  if (!is.na(loan_data$BorrState[i]) && !is.na(loan_data$CDC_State[i])) {
+    if (loan_data$BorrState[i] == loan_data$CDC_State[i]) {
+      loan_data$BorrSameCDC[i] <- "YES"
+    } else {
+      loan_data$BorrSameCDC[i] <- "NO"
+    }
+  }
+}
+```
+
+Create the indicator of whether ProjectState is the same as BorrState
+```{r}
+loan_data$ProjectSameBorr <- NA
+for (i in 1:nrow(loan_data)) {
+  if (!is.na(loan_data$BorrState[i]) && !is.na(loan_data$ProjectState[i])) {
+    if (loan_data$BorrState[i] == loan_data$ProjectState[i]) {
+      loan_data$ProjectSameBorr[i] <- "YES"
+    } else {
+      loan_data$ProjectSameBorr[i] <- "NO"
+    }
+  }
+}
+```
+
+Divide the dataset into training, in-of-sample test, and out-of-sample test sets
+```{r}
+train.org = loan_data[loan_data$ApprovalFiscalYear %in% seq(1990, 2004),]
+test.in.samp.org = loan_data[loan_data$ApprovalFiscalYear %in% seq(2002, 2004),]
+test.out.samp.org = loan_data[loan_data$ApprovalFiscalYear %in% seq(2005, 2014),]
+```
+
+For cleaning data
+```{r}
+train.org <- train.org[!is.na(train.org$LoanStatus),]
+test.in.samp.org <- test.in.samp.org[!is.na(test.in.samp.org$LoanStatus),]
+test.out.samp.org <- test.out.samp.org[!is.na(test.out.samp.org$LoanStatus),]
+```
+
+Upload the splitted dataset
+```{r}
+train.org <- read.csv("train.csv")
+test.in.samp.org = read.csv("test_insample.csv")
+test.out.samp.org = read.csv("test_outsample.csv")
+```
+
+After splitting data based on 1-year period, we first check the portion of default loans in the pool
+```{r}
+default.ratio = nrow(loan_data[loan_data$LoanStatus == 1,])/nrow(loan_data)
+default.ratio.train = nrow(train[train$LoanStatus == 1,])/nrow(train)
+default.ratio.test = nrow(test[test$LoanStatus == 1,])/nrow(test)
+default.ratio.train.in.samp = nrow(train.in.samp[train.in.samp$LoanStatus == 1,])/nrow(train.in.samp)
+default.ratio.test.in.samp = nrow(test.in.samp[test.in.samp$LoanStatus == 1,])/nrow(test.in.samp)
+default.ratio.test.out.samp = nrow(test.out.samp[test.out.samp$LoanStatus == 1,])/nrow(test.out.samp)
+```
+
+```{r}
+train.in.samp <- read.csv("final_train.csv")
+test.in.samp <- read.csv("final_test_insample.csv")
+test.out.samp <- read.csv("final_test_outsample.csv")
+```
+
+```{r}
+train.in.samp <- train.in.samp[!is.na(train.in.samp$LoanStatus),]
+test.in.samp <- test.in.samp[!is.na(test.in.samp$LoanStatus),]
+test.out.samp <- test.out.samp[!is.na(test.out.samp$LoanStatus),]
+```
+
+Load the modified dataset to the console again
+```{r}
+train.in.samp.month <- read.csv("Final_insample_train.csv")
+test.in.samp.month <- read.csv("Final_insample_test.csv")
+test.out.samp.month <- read.csv("final_outsample_test.csv")
+```
+
+Changing NAs in BusinessType and NaicsTrimmed to become "Blank"
+```{r}
+library(forcats)
+levels(sample$NaicsTrimmed) <- c(levels(sample$NaicsTrimmed),"Blank")
+sample$NaicsTrimmed[is.na(sample$NaicsTrimmed)] <- "Blank"  
+
+levels(test.in.samp$NaicsTrimmed) <- c(levels(test.in.samp$NaicsTrimmed),"Blank")
+test.in.samp$NaicsTrimmed[is.na(test.in.samp$NaicsTrimmed)] <- "Blank"  
+
+levels(test.out.samp$NaicsTrimmed) <- c(levels(test.out.samp$NaicsTrimmed),"Blank")
+test.out.samp$NaicsTrimmed[is.na(test.out.samp$NaicsTrimmed)] <- "Blank"  
+```
+
+Treat "NaicsTrimmed" as a categorial variable refering to the first 2 digits of industry
+```{r}
+train.in.samp$NaicsTrimmed <- as.factor(train.in.samp$NaicsTrimmed)
+test.in.samp$NaicsTrimmed <- as.factor(test.in.samp$NaicsTrimmed)
+test.out.samp$NaicsTrimmed <- as.factor(test.out.samp$NaicsTrimmed)
+```
+
+```{r}
+sample <- rbind(train.in.samp, test.in.samp)
+sample <- as.data.frame(sample)
+```
+
+Scale all continuous variables
+```{r}
+sample$Unemployment.Rate <- scale(sample$Unemployment.Rate)
+sample$S.P.500.Return <- scale(sample$S.P.500.Return)
+sample$Housing.Price.Index <- scale(sample$Housing.Price.Index)
+sample$TotalLoanAmount <- scale(sample$TotalLoanAmount)
+```
+
+#Cox regression modeling
+Time-depedent hazards model
+```{r}
+library(survival)
+cox.m <- coxph(Surv(Start, Stop, LoanStatus) ~ TotalLoanAmount + NaicsTrimmed + BorrRegion + TermInMonths + BorrSameCDC + ProjectSameBorr + Unemployment.Rate + S.P.500.Return + Housing.Price.Index + BusinessType, data = sample)
+```
+
+```{r}
+summary(cox.m)
+```
+
+#Statisical inference
+
+Apart from consideration of p-values, we built the reduced model that excludes apparently insignificant variables. Then, we apply ANOVA function in R to compute F-statistics and decide whether we should reject the hypothesis where the null is the reduced model.
+
+Analysis of Variance
+```{r}
+cox.m.test <- coxph(Surv(Start, Stop, LoanStatus) ~  TotalLoanAmount + NaicsTrimmed + TermInMonths + Unemployment.Rate + S.P.500.Return + Housing.Price.Index + BorrSameCDC + BusinessType + BorrRegion, data = sample)
+anova(cox.m, cox.m.test)
+```
+
+#Cross Validation
+Extract covariates
+```{r}
+cov.train <- sample[, c("TotalLoanAmount", "Unemployment.Rate", "S.P.500.Return", "Housing.Price.Index", "TermInMonths")]
+```
+
+
+Cross Validation with 10 folds
+```{r}
+library(glmnet)
+cov.train <- as.matrix(cov.train)
+surv.response <- Surv(sample$Stop, sample$LoanStatus)
+cv.cox.fit <- cv.glmnet(cov.train, surv.response, family = "cox", nfolds = 10)
+cox.fit.elastic <- glmnet(cov.train, surv.response, family = "cox", alpha = 0.5)
+all.covariates <- coef(cox.fit, s = cv.cox.fit$lambda.min)
+selected.indices <- which(all.covariates != 0)
+selected.covariates <- (all.covariates[selected.indices])
+```
+
+```{r}
+all.covariates
+```
+
+```{r}
+plot()
+```
+
+```{r}
+cox.fit <- glmnet(cov.train, surv.response, family = "cox", alpha = 0)
+all.covariates.ridge <- coef(cox.fit, s = cv.cox.fit$lambda.min)
+all.covariates.ridge
+plot(cox.fit)
+```
+
+```{r}
+cox.fit.elastic <- glmnet(cov.train, surv.response, family = "cox", alpha = 0.5)
+plot(cox.fit.elastic)
+```
+
+```{r}
+plot(cv.cox.fit)
+```
+
+#Predictive performance
+
+Use predict() function with "expected" type to predict the survival probability of each loan, which is equal to exp{-expected} as stated in R package.
+```{r}
+pred.cox.train <- exp(-predict(cox.m.test, newdata = sample, type = "expected"))
+pred.cox.test.in <- exp(-predict(cox.m.test, newdata = test.in.samp, type = "expected"))
+pred.cox.test.out <- exp(-predict(cox.m.test, newdata = test.out.samp, type = "expected"))
+```
+
+Since the survival probability is exp{-expected}, the default probability is 1 - exp{-expected}. We then plot ROC curve from those values. Also, we show how the variation of threshold generates predictive errors as illustrated below.
+
+Test performance on train set
+```{r}
+pred.train <- prediction((1 - pred.cox.train), sample$LoanStatus)
+perf.train <- performance(pred.train , measure = "tpr", x.measure = "fpr")
+auc.train <- performance(pred.train, measure = "auc")
+auc.train
+plot(perf.train, colorize = TRUE)
+```
+
+Test performance on in-sample test set
+```{r}
+pred.test.in <- prediction((1 - pred.cox.test.in), test.in.samp$LoanStatus)
+perf.test.in <- performance(pred.test.in , measure = "tpr", x.measure = "fpr")
+auc.test.in <- performance(pred.test.in, measure = "auc")
+auc.test.in
+plot(perf.test.in, colorize = TRUE)
+```
+
+```{r}
+pred.test.out <- prediction((1 - pred.cox.test.out), test.out.samp$LoanStatus)
+perf.test.out <- performance(pred.test.out , measure = "tpr", x.measure = "fpr")
+auc.test.out <- performance(pred.test.out, measure = "auc")
+auc.test.out
+plot(perf.test.out, colorize = TRUE)
+```
+
+Plot 3 ROC curves in only graph
+```{r}
+plot(perf.train, col = "red", legend = c("Train"))
+plot(perf.test.in, add = TRUE, col = "green", legend = c("In-sample test"))
+plot(perf.test.out, add = TRUE, col = "blue", legend = c("Out-sample test"))
+```
+
+Missclassification Rate
+```{r}
+test.out.samp.test <- cbind(test.out.samp, pred.cox)
+```
+
+```{r}
+train.in.samp.test <- cbind(train.in.samp, pred.cox)
+colnames(train.org)[1] <- "Loan.ID"
+colnames(test.out.samp.test)[1] <- "Loan.ID"
+```
+
+```{r}
+train.in.samp.selected <- train.in.samp.test[, c("Loan.ID", "LoanAge", "Stop", "pred.cox")]
+num.dim <- nrow(train.org)
+surv.prob <- rep(1, num.dim)
+for (i in (train.in.samp.selected$Loan.ID[1]):(num.dim  - 1 + train.in.samp.selected$Loan.ID[1])) {
+  each.loan.list <- train.in.samp.selected[train.in.samp.selected$Loan.ID == i,]
+  surv.prob[i - train.in.samp.selected$Loan.ID[1] + 1] <- prod(each.loan.list$pred.cox)
+}
+```
+
+```{r}
+test.out.samp.selected <- test.out.samp.test[, c("Loan.ID", "LoanAge", "Stop", "pred.cox")]
+num.dim <- nrow(test.out.samp.org)
+surv.prob <- rep(1, num.dim)
+for (i in (test.out.samp.selected$Loan.ID[1]):(num.dim  - 1 + test.out.samp.selected$Loan.ID[1])) {
+  each.loan.list <- test.out.samp.selected[test.out.samp.selected$Loan.ID == i,]
+  surv.prob[i - test.out.samp.selected$Loan.ID[1] + 1] <- prod(each.loan.list$pred.cox)
+}
+```
+
+```{r}
+test.out.samp.org <- test.out.samp.org[, c("Loan.ID", "LoanStatus")]
+test.out.samp.org.comp <- cbind(test.out.samp.org, surv.prob)
+```
+
+```{r}
+train.org.comp <- cbind(train.org, surv.prob)
+```
+
+Measure performance on train set (missclassfication rate as a metric)
+```{r}
+t <- seq(0.1, 1.00, by = 0.02)
+missRate <- rep(0, length(t))
+for(j in 1:length(t)) {
+  for (i in 1:nrow(train.org.comp)) {
+    if (train.org.comp$surv.prob[i] >= t[j]) {
+      train.org.comp$pred.status[i] <- 0
+    } else {
+      train.org.comp$pred.status[i] <- 1
+    }
+  }
+  
+  num.incorrect <- 0
+  for (i in 1:nrow(train.org.comp)) {
+    if (train.org.comp$LoanStatus[i] != train.org.comp$pred.status[i]) {
+      num.incorrect <- num.incorrect + 1
+    }
+  }
+  missRate[j] <- num.incorrect/(nrow(train.org.comp))
+}
+```
+
+Measure performance on test set
+```{r}
+t <- seq(0.1, 1.00, by = 0.02)
+missRate <- rep(0, length(t))
+for(j in 1:length(t)) {
+  for (i in 1:nrow(test.out.samp.org.comp)) {
+
+    if (test.out.samp.org.comp$surv.prob[i] >= t[j]) {
+      test.out.samp.org.comp$pred.status[i] <- 0
+    } else {
+      test.out.samp.org.comp$pred.status[i] <- 1
+    }
+  }
+  
+  num.incorrect <- 0
+  for (i in 1:nrow(test.out.samp.org.comp)) {
+    if (test.out.samp.org.comp$LoanStatus[i] != test.out.samp.org.comp$pred.status[i]) {
+      num.incorrect <- num.incorrect + 1
+    }
+  }
+  missRate[j] <- num.incorrect/(nrow(test.out.samp.org.comp))
+}
+```
+
+##Comparable model
+
+Time-dependent logistic regression
+```{r}
+library(dynamichazard)
+logit.glm <- static_glm(Surv(Start, Stop, LoanStatus) ~  TotalLoanAmount + NaicsTrimmed + BorrRegion + TermInMonths + BorrSameCDC + ProjectSameBorr + Unemployment.Rate + S.P.500.Return + Housing.Price.Index + BusinessType, data = sample, family = "logit", id = sample$Loan.ID, by = 5)
+```
+
+```{r}
+summary(logit.glm)
+```
+
+```{r}
+prob <- predict(logit.glm, newdata = test.out.samp, type = "response")
+```
+
+```{r}
+pred <- prediction(prob, test.out.samp$LoanStatus)
+perf <- performance(pred, measure = "tpr", x.measure = "fpr")
+auc <- performance(pred, measure = "auc")
+auc
+plot(perf)
+```
+
+
+#Distribution of Loss
+Estimate the distribution of total loss in a pool of 500 loans
+Upload the datasets of randomly selected 500 loans for 1-year and 5-year period
+```{r}
+one.year.pool <- read.csv("500loans1.csv")
+five.year.pool <- read.csv("500loans5.csv")
+```
+
+Treat the charge-off date as a continuous variable
+```{r}
+one.year.pool$Cont_ChargeOffDate <- as.integer(as.Date(one.year.pool$ChargeOffDate, "%m/%d/%Y") - as.Date("1990-01-01"))
+
+five.year.pool$Cont_ChargeOffDate <- as.integer(as.Date(five.year.pool$ChargeOffDate, "%m/%d/%Y") - as.Date("1990-01-01"))
+```
+
+Use "muhaz" package to create the hazard function from the original data
+```{r}
+library(muhaz)
+fmuhaz <- muhaz(times = loan_data$Cont_ApprovalDate, delta = loan_data$LoanStatus, n.min.grid = 1000, n.est.grid = 4000)
+hfun <- approxfun(x = fmuhaz$est.grid, y = fmuhaz$haz.est)
+```
+
+#Measure VaR and Average VaR at 95% and 99%
+
+Define the function to compute Value at Risk and Expected Shortfall (Average Value at Risk)
+```{r}
+VaRnormal <- function(returnVector, prob = 0.05, 
+                      notional = 1, expected.return = mean(returnVector), 
+                      digits = 4) {
+  if(prob > .5) prob <- 1 - prob
+  ans <- qnorm(1 - prob, mean=expected.return, 
+               sd = sd(returnVector)) * notional
+  signif(ans, digits = digits)
+}
+
+VaRnormal.2 <- function(returnVector, prob = 0.01, 
+                      notional = 1, expected.return = mean(returnVector), 
+                      digits = 4) {
+  if(prob > .5) prob <- 1 - prob
+  ans <- qnorm(1 - prob, mean=expected.return, 
+               sd = sd(returnVector)) * notional
+  signif(ans, digits = digits)
+}
+```
+
+```{r}
+ESnormal <- function(returnVector, prob = 0.05, 
+                     notional = 1, expected.return = mean(returnVector), 
+                     digits = 4)
+{
+  if(prob > .5) prob <- 1 - prob
+  retsd <- sd(returnVector)
+  v <- qnorm(1 - prob, mean=expected.return, sd=retsd)
+  tailExp <- (integrate(function(x) 
+    x * dnorm(x, mean=expected.return, sd=retsd), 
+    v, Inf)$value) / prob
+  ans <- tailExp * notional
+  signif(ans, digits=digits)
+}
+
+ESnormal.2 <- function(returnVector, prob = 0.01, 
+                     notional = 1, expected.return = mean(returnVector), 
+                     digits = 4)
+{
+  if(prob > .5) prob <- 1 - prob
+  retsd <- sd(returnVector)
+  v <- qnorm(1 - prob, mean=expected.return, sd=retsd)
+  tailExp <- (integrate(function(x) 
+    x * dnorm(x, mean=expected.return, sd=retsd), 
+    v, Inf)$value) / prob
+  ans <- tailExp * notional
+  signif(ans, digits=digits)
+}
+```
+
+Estimate the distribution of loss for five-year pool
+```{r}
+num.rep <- 100
+n.rep.five <- 500
+VaR.vector.five <- rep(0, num.rep)
+ES.vector.five <- rep(0, num.rep)
+for (a in 1:num.rep) {
+  tau.five <- matrix(0, nrow = 500, ncol = n.rep.five)
+  eachLoss.five <- matrix(0, nrow = 500, ncol = n.rep.five)
+  right.censor <- max(fmuhaz$est.grid)
+  for (i in 1:n.rep.five) {
+    for (j in 1:nrow(five.year.pool)) {
+      if (!is.na(five.year.pool$Cont_ChargeOffDate[j])) {
+        randomU <- runif(1, min = 0, max = 1)
+        left.time <- five.year.pool$Cont_ApprovalDate[j]
+        right.time <- five.year.pool$Cont_ApprovalDate[j] + 1
+        if (left.time >= right.censor || right.time >= right.censor) {
+          left.time <- right.censor
+          right.time <- right.censor
+        }
+        intg.hzd.est <- integrate(hfun, left.time, right.time, stop.on.error = FALSE)
+        while (intg.hzd.est$value < -log(randomU)) {
+          right.time <- right.time + 1
+          if (right.time >= right.censor) {
+            break
+          }
+          intg.hzd.est <- integrate(hfun, left.time, right.time, stop.on.error = FALSE)
+        }
+        tau.five[j, i] <- right.time
+        if (tau.five[j, i] <= (five.year.pool$Cont_ApprovalDate[j]+five.year.pool$TermInMonths[j])) {
+          eachLoss.five[j, i] <- five.year.pool$LossRatio[j]
+        }
+      }
+    }
+  }
+  totalLoss.five <- rep(0, n.rep.five)
+  for (i in 1:n.rep.five) {
+    totalLoss.five[i] <- sum(eachLoss.five[, i])
+  }
+  totalLoss.five <- totalLoss.five/n.rep.five
+  VaR.vector.five[a] <- VaRnormal(totalLoss.five)
+  ES.vector.five[a] <- ESnormal(totalLoss.five)
+}
+```
+
+Estimate the distribution of loss for one-year pool
+```{r}
+num.rep <- 100
+n.rep <- 500
+VaR.vector <- rep(0, num.rep)
+ES.vector <- rep(0, num.rep)
+for (a in 1:num.rep) {
+  tau <- matrix(0, nrow = 500, ncol = n.rep)
+  eachLoss <- matrix(0, nrow = 500, ncol = n.rep)
+  right.censor <- max(fmuhaz$est.grid)
+  for (i in 1:n.rep) {
+    for (j in 1:nrow(one.year.pool)) {
+      if (!is.na(one.year.pool$Cont_ChargeOffDate[j])) {
+        randomU <- runif(1, min = 0, max = 1)
+        left.time <- one.year.pool$Cont_ApprovalDate[j]
+        right.time <- one.year.pool$Cont_ApprovalDate[j] + 1
+        if (left.time >= right.censor || right.time >= right.censor) {
+          left.time <- right.censor
+          right.time <- right.censor
+        }
+        intg.hzd.est <- integrate(hfun, left.time, right.time, stop.on.error = FALSE)
+        while (intg.hzd.est$value < -log(randomU)) {
+          right.time <- right.time + 1
+          if (right.time >= right.censor) {
+            break
+          }
+          intg.hzd.est <- integrate(hfun, left.time, right.time, stop.on.error = FALSE)
+        }
+        tau[j, i] <- right.time
+        if (tau[j, i] <= one.year.pool$Cont_ChargeOffDate[j]) {
+          eachLoss[j, i] <- one.year.pool$LossRatio[j]
+        }
+      }
+    }
+  }
+  totalLoss.one <- rep(0, n.rep)
+  for (i in 1:n.rep) {
+    totalLoss.one[i] <- sum(eachLoss[, i])
+  }
+  totalLoss.one <- totalLoss.one/n.rep
+  VaR.vector[a] <- VaRnormal(totalLoss.one)
+  ES.vector[a] <- ESnormal(totalLoss.one)
+}
+
+```
+
+```{r}
+VaRnormal.2(totalLoss.one)
+ESnormal.2(totalLoss.one)
+VaRnormal.2(totalLoss.five)
+ESnormal.2(totalLoss.five)
+```
+
+Distribution of total loss for a one-year pool of loans
+```{r}
+density.one <- density(totalLoss.one)
+plot(density.one)
+```
+
+Distribution of total loss for a five-year pool of loans
+```{r}
+density.five <- density(totalLoss.five)
+plot(density.five)
+```
+
+#Cash Waterfall Analysis
+```{r}
+med.tranche.loss <- rep(0, n.rep)
+senior.tranche.loss <- rep(0, n.rep)
+for (i in 1:n.rep) {
+  if (totalLoss.one[i] >= 0.05 && totalLoss.one[i] <= 0.15) {
+    med.tranche.loss[i] <- totalLoss.one[i] - 0.05
+  } else if (totalLoss.one[i] >= 0.15) {
+    med.tranche.loss[i] <- 0.10
+    senior.tranche.loss[i] <- totalLoss.one[i] - 0.15
+  }
+}
+```
+
+```{r}
+med.tranche.loss.five <- rep(0, n.rep.five)
+senior.tranche.loss.five <- rep(0, n.rep.five)
+for (i in 1:n.rep.five) {
+  if (totalLoss.five[i] >= 0.05 && totalLoss.five[i] <= 0.15) {
+    med.tranche.loss.five[i] <- totalLoss.five[i] - 0.05
+  } else if (totalLoss.five[i] >= 0.15) {
+    med.tranche.loss.five[i] <- 0.10
+    senior.tranche.loss.five[i] <- totalLoss.five[i] - 0.15
+  }
+}
+```
+
+Plot the distribution of loss for mezzhanine and senior tranches
+```{r}
+density.med.one <- density(med.tranche.loss)
+density.senior.one <- density(senior.tranche.loss)
+density.med.five <- density(med.tranche.loss.five)
+density.senior.five <- density(senior.tranche.loss.five)
+plot(density.med.one)
+plot(density.senior.one)
+plot(density.med.five)
+plot(density.senior.five)
+```
+
+Construct the confidence bands for VaR and AVaR at 95% confidence level
+```{r}
+lower.ci <- function(returnVector, prob = 0.05, 
+                     notional = 1, expected.return = mean(returnVector), 
+                     digits = 4) {
+  if(prob > .5) prob <- 1 - prob
+  ans <- qnorm(prob, mean=expected.return, 
+               sd = sd(returnVector)) * notional
+  signif(ans, digits = digits)
+}
+
+upper.ci <- function(returnVector, prob = 0.05, 
+                     notional = 1, expected.return = mean(returnVector), 
+                     digits = 4) {
+  if(prob > .5) prob <- 1 - prob
+  ans <- qnorm(1 - prob, mean=expected.return, 
+               sd = sd(returnVector)) * notional
+  signif(ans, digits = digits)
+}
+
+VaR.vector.five <- as.data.frame(VaR.vector.five)
+ES.vector.five <- as.data.frame(ES.vector.five)
+VaR.vector.five <- VaR.vector.five[VaR.vector.five$VaR.vector.five != 0,]
+ES.vector.five <- ES.vector.five[ES.vector.five$ES.vector.five != 0,]
+
+VaR.vector <- as.vector(VaR.vector.five)
+ES.vector.five <- as.vector(ES.vector.five)
+
+lower.ci(VaR.vector.five)
+upper.ci(VaR.vector.five)
+lower.ci(ES.vector.five)
+upper.ci(ES.vector.five)
+```
+
+```{r}
+VaR.vector <- as.data.frame(VaR.vector)
+ES.vector <- as.data.frame(ES.vector)
+VaR.vector <- VaR.vector[VaR.vector != 0,]
+ES.vector <- ES.vector[ES.vector != 0,]
+
+VaR.vector <- as.vector(VaR.vector)
+ES.vector <- as.vector(ES.vector)
+
+lower.ci(VaR.vector)
+upper.ci(VaR.vector)
+lower.ci(ES.vector)
+upper.ci(ES.vector)
+```
+
+The density plot of five-year VaR over multiple simulations
+```{r}
+density.VaR.five <- density(VaR.vector.five)
+plot(density.VaR.five)
+```
+
+The density plot of five-year expected shortfall over multiple simulations
+```{r}
+density.ES.five <- density(ES.vector.five)
+plot(density.ES.five)
+```
+
+The density plot of one-year VaR over multiple simulations
+```{r}
+density.VaR.one <- density(VaR.vector)
+plot(density.VaR.one)
+```
+
+The density plot of one-year expected shortfall over multiple simulations
+```{r}
+density.ES.one <- density(ES.vector)
+plot(density.ES.one)
+```
+
