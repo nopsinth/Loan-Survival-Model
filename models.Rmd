@@ -288,6 +288,7 @@ cox.fit.elastic <- glmnet(cov.train, surv.response, family = "cox", alpha = 0.5)
 plot(cox.fit.elastic)
 ```
 
+The plot of tuning penalty parameter
 ```{r}
 plot(cv.cox.fit)
 ```
@@ -614,6 +615,15 @@ for (a in 1:num.rep) {
 
 ```
 
+Risk measures at 95% confidence level
+```{r}
+VaRnormal(totalLoss.one)
+ESnormal(totalLoss.one)
+VaRnormal(totalLoss.five)
+ESnormal(totalLoss.five)
+```
+
+Risk measures at 99% confidence level
 ```{r}
 VaRnormal.2(totalLoss.one)
 ESnormal.2(totalLoss.one)
